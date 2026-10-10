@@ -47,7 +47,7 @@ def main():
 
         target = run_frame(cpu, ppu, target)
 
-        surf = pygame.image.frombuffer(ppu.framebuffer.tobytes(), (256, 240), "RGB")
+        surf = pygame.image.frombuffer(ppu.frame_rgb().tobytes(), (256, 240), "RGB")
         screen.blit(pygame.transform.scale(surf, screen.get_size()), (0, 0))
         pygame.display.flip()
         clock.tick(60)

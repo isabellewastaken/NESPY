@@ -74,7 +74,12 @@ class PPU:
 
         self.rgb = load_palette()
         self.pal_np = np.frombuffer(self.palette, dtype=np.uint8)  # live view
-        self.framebuffer = np.zeros((240, 256, 3), dtype=np.uint8)
+        self.index_buf = np.zeros((240, 256), dtype=np.uint8)   # palette index per pixel
+        self.chr_np = np.frombuffer(self.chr, dtype=np.uint8)   # live view of CHR
+        self._bg_key = -1                 # tile-row cache, see _bg_line
+        self._bg_dirty = True
+        self._tile_base = None
+        self._palshift = None
         self.line_sprites = [[] for _ in range(240)]   # sprite indices per line
         self._zeros = np.zeros(256, dtype=np.uint8)
 
@@ -101,6 +106,7 @@ class PPU:
                 self.chr[a] = val
         elif a < 0x3F00:
             self.vram[self.nt_map[(a >> 10) & 3] * 0x400 + (a & 0x3FF)] = val
+            self._bg_dirty = True         # invalidate the tile-row cache
         else:
             self.palette[self._pal_index(a)] = val & 0x3F
 
@@ -179,37 +185,43 @@ class PPU:
 
     def _bg_line(self):
         """Returns (pix, idx): 2-bit background pixel values and palette
-        indices for the 256 pixels of the current line."""
+        indices for the 256 pixels of the current line.
+
+        The 33 tile addresses and attribute palettes only change when the
+        scroll enters a new tile row/column, nametable memory is written, or
+        the pattern table select changes. They are cached, so each of the 8
+        lines in a tile row only re-reads its CHR bytes."""
         v = self.v
-        coarse_x = v & 0x1F
-        coarse_y = (v >> 5) & 0x1F
-        nt_sel = (v >> 10) & 3
-        fine_y = (v >> 12) & 7
-        pt = 0x1000 if self.ctrl & 0x10 else 0
-        chr_, vram, nt_map = self.chr, self.vram, self.nt_map
+        key = (v & 0x0FFF) | ((self.ctrl & 0x10) << 8)   # excludes fine Y
+        if key != self._bg_key or self._bg_dirty:
+            self._bg_key = key
+            self._bg_dirty = False
+            coarse_x = v & 0x1F
+            coarse_y = (v >> 5) & 0x1F
+            nt_sel = (v >> 10) & 3
+            pt = 0x1000 if self.ctrl & 0x10 else 0
+            vram, nt_map = self.vram, self.nt_map
+            row = coarse_y << 5
+            arow = 0x3C0 + ((coarse_y >> 2) << 3)
+            ashift = (coarse_y & 2) << 1
+            bases = [0] * 33
+            pals = [0] * 33
+            for i in range(33):                  # 32 tiles + 1 for fine-X scroll
+                cx = coarse_x + i
+                off = nt_map[nt_sel ^ ((cx >> 5) & 1)] << 10   # crossing x=32 flips nametable
+                cx &= 0x1F
+                bases[i] = pt + (vram[off + row + cx] << 4)
+                pals[i] = ((vram[off + arow + (cx >> 2)] >> (ashift | (cx & 2))) & 3) << 2
+            self._tile_base = np.array(bases, dtype=np.intp)
+            self._palshift = np.repeat(np.array(pals, dtype=np.uint8), 8)
 
-        row = coarse_y << 5
-        arow = 0x3C0 + ((coarse_y >> 2) << 3)
-        ashift = (coarse_y & 2) << 1
-        los, his, pals = bytearray(33), bytearray(33), bytearray(33)
-
-        for i in range(33):                      # 32 tiles + 1 for fine-X scroll
-            cx = coarse_x + i
-            off = nt_map[nt_sel ^ ((cx >> 5) & 1)] << 10   # crossing x=32 flips nametable
-            cx &= 0x1F
-            tile = vram[off + row + cx]
-            pals[i] = (vram[off + arow + (cx >> 2)] >> (ashift | (cx & 2))) & 3
-            a = pt + (tile << 4) + fine_y
-            los[i] = chr_[a]
-            his[i] = chr_[a + 8]
-
+        base = self._tile_base + ((v >> 12) & 7)
+        chr_ = self.chr_np
         fx = self.x
-        pix = LUT[np.frombuffer(los, np.uint8), np.frombuffer(his, np.uint8)]
-        pix = pix.reshape(-1)[fx:fx + 256]
-        palpx = np.repeat(np.frombuffer(pals, np.uint8), 8)[fx:fx + 256]
+        pix = LUT[chr_[base], chr_[base + 8]].reshape(-1)[fx:fx + 256]
         if not self.mask & 0x02:                 # hide background in leftmost 8 pixels
             pix[:8] = 0
-        idx = self.pal_np[np.where(pix == 0, 0, (palpx << 2) | pix)]
+        idx = self.pal_np[np.where(pix == 0, 0, self._palshift[fx:fx + 256] | pix)]
         return pix, idx
 
     # ------------------------------------------------------------ sprites
@@ -294,7 +306,7 @@ class PPU:
                 idx = np.full(256, self.palette[0], dtype=np.uint8)
             if mask & 0x10:
                 idx = self._sprite_line(line, pix, idx)
-            self.framebuffer[line] = self.rgb[idx & 0x3F]
+            self.index_buf[line] = idx
             if rendering:
                 self._inc_y()
         elif line == 241:
@@ -307,3 +319,12 @@ class PPU:
             self.overflow = False
             if rendering:
                 self.v = (self.v & 0x041F) | (self.t & 0x7BE0)    # copy vertical bits
+
+    # ------------------------------------------------------------ output
+    def frame_rgb(self):
+        """Convert the frame's palette indices to a (240, 256, 3) RGB array."""
+        return self.rgb[self.index_buf & 0x3F]
+
+    @property
+    def framebuffer(self):
+        return self.frame_rgb()

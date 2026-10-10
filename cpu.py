@@ -18,6 +18,7 @@ class CPU:
         self.cycles = 0
         self.crossed = 0   # page-cross flag set by addressing modes
         self.extra = 0     # extra cycles from taken branches
+        self.idle = False  # set when a JMP jumps to itself (see main.run_frame)
 
     # ---------------------------------------------------------------- setup
     def reset(self):
@@ -233,7 +234,10 @@ class CPU:
         self._nz(r)
 
     # ---------------------------------------------------------------- jumps / calls
-    def op_jmp(self, ad): self.pc = ad
+    def op_jmp(self, ad):
+        if ad == ((self.pc - 3) & 0xFFFF):
+            self.idle = True        # JMP to itself: only an interrupt can break out
+        self.pc = ad
 
     def op_jsr(self, ad):
         ret = (self.pc - 1) & 0xFFFF
